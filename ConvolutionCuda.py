@@ -1,72 +1,117 @@
-from numba import cuda
-import numpy as np
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <wb.h>
 
-from math import exp
+#define MASK_WIDTH 5
+#define TILE_WIDTH 16
+#define CLAMP(x) (min(max((x), 0.0), 1.0))
 
-@cuda.jit
-def gaussian_gpu(sigma, kernel_size,kernel):
-    m=kernel//2
-    n=kernel_size//2
+__global__ void tiledConvolution2D(float* d_inputImage, float* d_outputImage,
+                                   const float* __restrict__ d_mask,
+                                   int channels, int width, int height) {
+    __shared__ float tile[TILE_WIDTH + MASK_WIDTH - 1][TILE_WIDTH + MASK_WIDTH - 1][3];
 
-    x=cuda.threadIdx.x
-    y=cuda.threadIdx.y
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
 
-    kernel[x,y]=exp(-(x-m)**2 + (y-n)**2 / (2*sigma**2)) # The amount of smoothing and the amount of blur means the higher the kernel and sigma size higher the blur
+    int outputRow = by * TILE_WIDTH + ty;
+    int outputCol = bx * TILE_WIDTH + tx;
 
-sigma=5.3
-kernel_size=30
+    int inputRow = outputRow - MASK_WIDTH / 2;
+    int inputCol = outputCol - MASK_WIDTH / 2;
 
-kernel=np.zeros((kernel_size, kernel_size), np.float32) # float32 matrix (commonly used dataType to respesernt images in arrays)
+    for (int ch = 0; ch < channels; ch++) {
+        if (inputRow >= 0 && inputRow < height && inputCol >= 0 && inputCol < width) {
+            tile[ty][tx][ch] = d_inputImage[(inputRow * width + inputCol) * channels + ch];
+        } else {
+            tile[ty][tx][ch] = 0.0f;
+        }
+    }
+    __syncthreads();
 
-d_kernel=cuda.to_device(kernel) # transfering data from cpu to gpu 
+    if (ty < TILE_WIDTH && tx < TILE_WIDTH && outputRow < height && outputCol < width) {
+        for (int ch = 0; ch < channels; ch++) {
+            float result = 0.0f;
+            for (int i = 0; i < MASK_WIDTH; i++) {
+                for (int j = 0; j < MASK_WIDTH; j++) {
+                    result += d_mask[i * MASK_WIDTH + j] * tile[ty + i][tx + j][ch];
+                }
+            }
+            d_outputImage[(outputRow * width + outputCol) * channels + ch] = CLAMP(result);
+        }
+    }
+}
 
-@cuda.jit
+int main(int argc, char* argv[]) {
+    wbArg_t args;
+    int maskRows, maskCols;
+    int width, height, channels;
+    char* inputImageFile;
+    char* inputMaskFile;
 
-def convolve(result,mask,image): # convloution function for CUDA
-    i,j=cuda.grid(2) #2d cords
-    image_rows, image_cols =image.shape
-    if( i>=image_rows) or (j>=image_cols):
-        return 
-    
-    delta_rows= mask.shape[0] //2
-    delta_cols= mask.shape[1] //2
+    float* h_inputImage;
+    float* h_outputImage;
+    float* h_mask;
+    float* d_inputImage;
+    float* d_outputImage;
+    float* d_mask;
 
-    s=0
-    for k in range(mask.shape[0]):
-        for l in range(mask.shape[1]):
-            i_k=i-k+delta_rows
-            j_l=j-l+delta_cols
-            if (i_k>=0) and (i_k<image_rows) and (j_l>=0) and (j_l<=image_cols):
-                s+=mask[k,l] * image[i_k,j_l]
-    result[i,j]=s
+    wbImage_t inputImg;
+    wbImage_t outputImg;
 
-from PIL import Image, ImageOps # used to work with images in python
+    args = wbArg_read(argc, argv);
+    inputImageFile = wbArg_getInputFile(args, 0);
+    inputMaskFile = wbArg_getInputFile(args, 1);
 
-image=np.array(ImageOps.grayscale(Image.open('ahmad.jpeg'))) # converting image to nparray
+    inputImg = wbImport(inputImageFile);
+    h_mask = (float*)wbImport(inputMaskFile, &maskRows, &maskCols);
 
-d_image= cuda.to_device(image) # transfering image from host to device
+    assert(maskRows == MASK_WIDTH);
+    assert(maskCols == MASK_WIDTH);
 
-d_result = cuda.device_array_like(image)
+    width = wbImage_getWidth(inputImg);
+    height = wbImage_getHeight(inputImg);
+    channels = wbImage_getChannels(inputImg);
 
-gaussian_gpu[(1,), (kernel_size, kernel_size) ]( sigma, kernel_size, d_kernel)
+    outputImg = wbImage_new(width, height, channels);
+    h_inputImage = wbImage_getData(inputImg);
+    h_outputImage = wbImage_getData(outputImg);
 
-blockdim=(32,32)
+    wbTime_start(GPU, "GPU Memory Allocation + Copy + Compute");
 
-griddim=(image.shape[0]// blockdim[0]+ 1, image.shape[1] // blockdim[1]+1)
+    // Allocate GPU memory
+    cudaMalloc((void**)&d_inputImage, width * height * channels * sizeof(float));
+    cudaMalloc((void**)&d_outputImage, width * height * channels * sizeof(float));
+    cudaMalloc((void**)&d_mask, MASK_WIDTH * MASK_WIDTH * sizeof(float));
 
-import time
-start= time.process_time()
-convolve[griddim,blockdim](d_result,d_kernel,d_image)
-print(time.process_time()- start)
-result = d_result.copy_to_host()
+    // Copy data to GPU
+    cudaMemcpy(d_inputImage, h_inputImage, width * height * channels * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_mask, h_mask, MASK_WIDTH * MASK_WIDTH * sizeof(float), cudaMemcpyHostToDevice);
 
-import matplotlib.pyplot as plt
+    // Define kernel configuration
+    dim3 dimBlock(TILE_WIDTH + MASK_WIDTH - 1, TILE_WIDTH + MASK_WIDTH - 1, 1);
+    dim3 dimGrid((width - 1) / TILE_WIDTH + 1, (height - 1) / TILE_WIDTH + 1, 1);
 
-plt.figure()
-plt.imshow(image, cmap='gray')
-plt.title("Before convolution:")
-plt.figure()
-plt.imshow(result, cmap='gray')
-plt.title("After convolution:")
-plt.show()
+    // Launch kernel
+    tiledConvolution2D<<<dimGrid, dimBlock>>>(d_inputImage, d_outputImage, d_mask, channels, width, height);
 
+    // Copy result back to host
+    cudaMemcpy(h_outputImage, d_outputImage, width * height * channels * sizeof(float), cudaMemcpyDeviceToHost);
+
+    wbTime_stop(GPU, "GPU Memory Allocation + Copy + Compute");
+
+    wbSolution(args, outputImg);
+
+    // Free memory
+    cudaFree(d_inputImage);
+    cudaFree(d_outputImage);
+    cudaFree(d_mask);
+
+    free(h_mask);
+    wbImage_delete(inputImg);
+    wbImage_delete(outputImg);
+
+    return 0;
+}
