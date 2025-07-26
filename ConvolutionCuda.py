@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <wb.h>
-
+#made cahnges
 #define MASK_WIDTH 5
 #define TILE_WIDTH 16
 #define CLAMP(x) (min(max((x), 0.0), 1.0))
